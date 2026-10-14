@@ -1,3 +1,6 @@
+# Keep formatter checks consistent on Windows and Unix.
+* text=auto eol=lf
+
 .github/copilot-instructions.md linguist-generated=true
 .github/instructions/** linguist-generated=true
 pnpm-lock.yaml linguist-generated=true

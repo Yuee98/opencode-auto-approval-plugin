@@ -1,4 +1,5 @@
 import type { PluginConfiguration } from "./config.js";
+import { selectUserMessageHistory } from "./review-context.js";
 import {
   OversizeError,
   parseVerdict,
@@ -36,13 +37,19 @@ export class AgentReviewer implements Reviewer {
 
   async review(input: ReviewRequest): Promise<ReviewVerdict> {
     const check = reviewCheck();
-    const text = reviewerPrompt({
-      request: input,
-      instructions: this.#configuration.reviewer.instructions,
-      check,
-    });
     const { maxInputBytes } = this.#configuration.reviewer.agent;
-    const bytes = Buffer.byteLength(text, "utf8");
+    const { value: text, size: bytes } = selectUserMessageHistory({
+      request: input,
+      maxUserMessages: this.#configuration.reviewer.maxUserMessages,
+      budget: maxInputBytes,
+      build: (request) =>
+        reviewerPrompt({
+          request,
+          instructions: this.#configuration.reviewer.instructions,
+          check,
+        }),
+      measure: (prompt) => Buffer.byteLength(prompt, "utf8"),
+    });
     if (bytes > maxInputBytes) {
       // An over-long prompt would be compacted or cut by the session, and the
       // reviewer would judge a summary.

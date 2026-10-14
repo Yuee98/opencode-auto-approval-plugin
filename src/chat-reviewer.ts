@@ -2,6 +2,7 @@ import * as z from "zod/mini";
 
 import type { ChatConfiguration, PluginConfiguration } from "./config.js";
 import { type Fetch, postJSON } from "./http.js";
+import { selectUserMessageHistory } from "./review-context.js";
 import {
   assertReadWhole,
   OversizeError,
@@ -41,6 +42,7 @@ const usageSchema = z.object({
 
 export class ChatReviewer implements Reviewer {
   readonly #configuration: ChatConfiguration;
+  readonly #maxUserMessages: number;
   readonly #timeoutMs: number;
   readonly #instructions: string | undefined;
   readonly #fetch: Fetch;
@@ -58,6 +60,7 @@ export class ChatReviewer implements Reviewer {
       throw new Error("The chat reviewer is not configured.");
     }
     this.#configuration = chat;
+    this.#maxUserMessages = input.configuration.reviewer.maxUserMessages;
     this.#timeoutMs = input.configuration.reviewer.timeoutMs;
     this.#instructions = input.configuration.reviewer.instructions;
     this.#fetch = input.fetch ?? globalThis.fetch;
@@ -91,13 +94,14 @@ export class ChatReviewer implements Reviewer {
     tokens: { input: number | null; output: number | null };
   }): Promise<ReviewVerdict> {
     const check = reviewCheck();
-    const prompt = reviewerPrompt({
-      request: input.request,
-      instructions: this.#instructions,
-      check,
-    });
     const { model, maxInputBytes } = this.#configuration;
-    const bytes = Buffer.byteLength(prompt, "utf8");
+    const { value: prompt, size: bytes } = selectUserMessageHistory({
+      request: input.request,
+      maxUserMessages: this.#maxUserMessages,
+      budget: maxInputBytes,
+      build: (request) => reviewerPrompt({ request, instructions: this.#instructions, check }),
+      measure: (text) => Buffer.byteLength(text, "utf8"),
+    });
     if (bytes > maxInputBytes) {
       input.tokens.input = 0;
       input.tokens.output = 0;

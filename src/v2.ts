@@ -8,6 +8,7 @@ import {
 } from "./agent-reviewer.js";
 import type { ModelReference } from "./config.js";
 import { usesAgentReviewer, parsePluginConfiguration } from "./config.js";
+import { UserMessageWindow } from "./review-context.js";
 import type { ReviewSessionClient } from "./reviewer.js";
 import type { PluginDependencies } from "./shared.js";
 import { reviewForApproval, reviewToolCallOrThrow } from "./shared.js";
@@ -85,7 +86,9 @@ export function createV2Plugin(dependencies: PluginDependencies): Plugin.Plugin 
         configuration,
         directory: context.location.directory,
       });
-      const intents = new Map<string, string>();
+      const intents = new UserMessageWindow({
+        maxUserMessages: configuration.reviewer.maxUserMessages,
+      });
 
       // `update` on an unknown ID registers a new agent; the branded ID/Name
       // types are plain strings at runtime. Only the agent reviewer needs one,
@@ -114,7 +117,7 @@ export function createV2Plugin(dependencies: PluginDependencies): Plugin.Plugin 
 
       await context.session.hook("prompt", (event) => {
         if (reviewer.isReviewerSession({ sessionID: event.sessionID })) return;
-        intents.set(event.sessionID, event.prompt.text);
+        intents.append({ sessionID: event.sessionID, text: event.prompt.text });
       });
 
       const sessionModel = async (sessionID: string): Promise<ModelReference | undefined> => {
@@ -139,7 +142,7 @@ export function createV2Plugin(dependencies: PluginDependencies): Plugin.Plugin 
               sessionID: event.sessionID,
               action: event.action,
               resource: { resources: event.resources, metadata: event.metadata },
-              userIntent: intents.get(event.sessionID),
+              ...intents.context({ sessionID: event.sessionID }),
               model: await sessionModel(event.sessionID),
             },
           });
@@ -160,7 +163,7 @@ export function createV2Plugin(dependencies: PluginDependencies): Plugin.Plugin 
             sessionID: event.sessionID,
             action: event.tool,
             resource: event.input,
-            userIntent: intents.get(event.sessionID),
+            ...intents.context({ sessionID: event.sessionID }),
             model: await sessionModel(event.sessionID),
           },
         });

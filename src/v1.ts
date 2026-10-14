@@ -8,6 +8,7 @@ import {
 } from "./agent-reviewer.js";
 import type { ModelReference } from "./config.js";
 import { usesAgentReviewer, parsePluginConfiguration } from "./config.js";
+import { UserMessageWindow } from "./review-context.js";
 import type { ReviewSessionClient } from "./reviewer.js";
 import type { PluginDependencies } from "./shared.js";
 import { isRecord, reviewForApproval, reviewToolCallOrThrow, textFromParts } from "./shared.js";
@@ -118,7 +119,9 @@ export function createV1Plugin(dependencies: PluginDependencies): Plugin {
       directory: context.directory,
     });
     const models = new Map<string, ModelReference>();
-    const intents = new Map<string, string>();
+    const intents = new UserMessageWindow({
+      maxUserMessages: configuration.reviewer.maxUserMessages,
+    });
 
     return {
       config: async (config) => {
@@ -132,7 +135,7 @@ export function createV1Plugin(dependencies: PluginDependencies): Plugin {
         // The reviewer's own prompts carry no user intent worth keeping.
         if (reviewer.isReviewerSession({ sessionID: event.sessionID })) return Promise.resolve();
         if (event.model) models.set(event.sessionID, event.model);
-        intents.set(event.sessionID, textFromParts(output.parts));
+        intents.append({ sessionID: event.sessionID, text: textFromParts(output.parts) });
         return Promise.resolve();
       },
       "chat.params": (event) => {
@@ -156,7 +159,7 @@ export function createV1Plugin(dependencies: PluginDependencies): Plugin {
             sessionID: request.sessionID,
             action: request.type,
             resource: { pattern: request.pattern, metadata: request.metadata },
-            userIntent: intents.get(request.sessionID),
+            ...intents.context({ sessionID: request.sessionID }),
             model: models.get(request.sessionID),
           },
         });
@@ -186,7 +189,7 @@ export function createV1Plugin(dependencies: PluginDependencies): Plugin {
             sessionID: event.sessionID,
             action: event.tool,
             resource: output.args,
-            userIntent: intents.get(event.sessionID),
+            ...intents.context({ sessionID: event.sessionID }),
             model: models.get(event.sessionID),
           },
         });

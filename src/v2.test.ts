@@ -412,3 +412,45 @@ describe("V2 session client", () => {
     expect(session.interrupt).toHaveBeenCalledWith({ sessionID: "review-session" });
   });
 });
+
+describe("V2 user-message windows", () => {
+  it("passes a bounded window to permission review, excluding other sessions and reviewer prompts", async () => {
+    const { plugin, review } = createPlugin({ verdict: "allow" });
+    const { context, hooks } = createContext({ options: { reviewer: { maxUserMessages: 3 } } });
+    await plugin.setup(context as never);
+    for (const text of ["discarded", "You may push", "Wait for review", "Do not push yet"]) {
+      await hooks["session.prompt"]?.({ sessionID: "session-1", prompt: { text } });
+    }
+    await hooks["session.prompt"]?.({
+      sessionID: "other",
+      prompt: { text: "Unrelated permission" },
+    });
+    await hooks["session.prompt"]?.({
+      sessionID: "review-session",
+      prompt: { text: "Reviewer prompt" },
+    });
+    await hooks["permission.evaluate"]?.(askEvent());
+    expect(review).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userIntent: "Do not push yet",
+        previousUserMessages: ["You may push", "Wait for review"],
+      }),
+    );
+  });
+
+  it("passes the same history in all-tools mode and preserves an empty latest prompt", async () => {
+    const { plugin, review } = createPlugin({ verdict: "allow" });
+    const { context, hooks } = createContext({ options: { mode: "all-tools" } });
+    await plugin.setup(context as never);
+    await hooks["session.prompt"]?.({ sessionID: "session-1", prompt: { text: "Push now" } });
+    await hooks["session.prompt"]?.({ sessionID: "session-1", prompt: { text: "" } });
+    await hooks["tool.execute.before"]?.({
+      sessionID: "session-1",
+      tool: "bash",
+      input: { command: "git push" },
+    });
+    expect(review).toHaveBeenCalledWith(
+      expect.objectContaining({ userIntent: "", previousUserMessages: ["Push now"] }),
+    );
+  });
+});

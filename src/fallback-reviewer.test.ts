@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { parsePluginConfiguration } from "./config.js";
+import { DecisionReviewer } from "./decision-reviewer.js";
 import { OversizeFallbackReviewer } from "./fallback-reviewer.js";
 import { OversizeError, type Reviewer, type ReviewRequest } from "./reviewer.js";
 
@@ -85,4 +87,32 @@ describe("OversizeFallbackReviewer", () => {
     expect(wrapped.isReviewerSession({ sessionID: "review-session" })).toBe(true);
     expect(wrapped.isReviewerSession({ sessionID: "main" })).toBe(false);
   });
+});
+
+it("hands the original complete user context to fallback when required decision input is oversized", async () => {
+  const fetch = vi.fn<typeof globalThis.fetch>();
+  const primary = new DecisionReviewer({
+    fetch,
+    configuration: parsePluginConfiguration({
+      options: {
+        reviewer: {
+          backend: "decision",
+          decision: { provider: "typesafe", apiKey: "test-key", maxInputTokens: 1000 },
+        },
+      },
+      env: {},
+    }),
+  });
+  const fallback = reviewer(async () => ({ verdict: "escalate", reason: "Needs review" }));
+  const wrapped = new OversizeFallbackReviewer({ primary, fallback });
+  const original = {
+    ...request,
+    resource: { content: "中".repeat(2000) },
+    userIntent: "Latest request",
+    previousUserMessages: ["Older user request"],
+  };
+  await expect(wrapped.review(original)).resolves.toMatchObject({ verdict: "escalate" });
+  expect(fetch).not.toHaveBeenCalled();
+  expect(fallback.review).toHaveBeenCalledWith(original);
+  expect(original.previousUserMessages).toEqual(["Older user request"]);
 });

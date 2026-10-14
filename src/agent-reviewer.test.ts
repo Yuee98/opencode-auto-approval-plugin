@@ -244,3 +244,34 @@ describe("AgentReviewer", () => {
     ).rejects.toThrow("lacked the review check");
   });
 });
+
+describe("AgentReviewer bounded user history", () => {
+  it("drops only whole older messages to fit the byte budget, retaining newer corrections", async () => {
+    const client = clientWithResponse({ response: '{"verdict":"escalate","reason":"wait"}' });
+    const reviewer = new AgentReviewer({
+      client,
+      configuration: parsePluginConfiguration({
+        options: { reviewer: { agent: { maxInputBytes: 4096 } } },
+        env: {},
+      }),
+    });
+    await reviewer.review({
+      source: "tool-call",
+      sessionID: "s",
+      action: "bash",
+      resource: { command: "git push" },
+      userIntent: "Do not push yet",
+      previousUserMessages: ["旧".repeat(2000), "Wait for review"],
+    });
+    const prompt = client.prompts[0]?.text ?? "";
+    const operation = JSON.parse(
+      prompt.split("\n").find((line) => line.startsWith('{"source"')) ?? "{}",
+    );
+    expect(operation).toMatchObject({
+      resource: { command: "git push" },
+      userIntent: "Do not push yet",
+      previousUserMessages: ["Wait for review"],
+    });
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(4096);
+  });
+});

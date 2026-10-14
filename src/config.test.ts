@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { parsePluginConfiguration } from "./config.js";
 
@@ -27,6 +27,7 @@ describe("parsePluginConfiguration", () => {
       reviewer: {
         backend: "agent",
         agent: { maxInputBytes: 200_000 },
+        maxUserMessages: 5,
         timeoutMs: 30_000,
         recordUsage: true,
       },
@@ -52,6 +53,7 @@ describe("parsePluginConfiguration", () => {
           model: { providerID: "openrouter", modelID: "openai/gpt-5.6-luna" },
           maxInputBytes: 200_000,
         },
+        maxUserMessages: 5,
         timeoutMs: 12_000,
         recordUsage: true,
       },
@@ -139,7 +141,7 @@ describe("parsePluginConfiguration", () => {
         endpoint: "https://api.typesafe.ai/v1/systemone",
         model: "jev-latest",
         minAllowProbability: 0.6,
-        maxStateTokens: 28_000,
+        maxInputTokens: 28_000,
         onOversize: "escalate",
       });
     });
@@ -152,7 +154,7 @@ describe("parsePluginConfiguration", () => {
             baseURL: "http://localhost:8787",
             model: "jev-1.13.0",
             minAllowProbability: 0.8,
-            maxStateTokens: 28_000,
+            maxInputTokens: 28_000,
             onOversize: "escalate",
           }),
           env: { TYPESAFE_API_KEY: "env-key", TYPESAFE_BASE_URL: "https://proxy.example" },
@@ -163,7 +165,7 @@ describe("parsePluginConfiguration", () => {
         endpoint: "http://localhost:8787/v1/systemone",
         model: "jev-1.13.0",
         minAllowProbability: 0.8,
-        maxStateTokens: 28_000,
+        maxInputTokens: 28_000,
         onOversize: "escalate",
       });
     });
@@ -290,7 +292,7 @@ describe("parsePluginConfiguration", () => {
         endpoint: `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/cloudflare/clef`,
         model: "clef",
         minAllowProbability: 0.6,
-        maxStateTokens: 20_000,
+        maxInputTokens: 20_000,
         onOversize: "escalate",
       });
     });
@@ -304,7 +306,7 @@ describe("parsePluginConfiguration", () => {
             accountId: optionAccount,
             model: "clef-flash",
             minAllowProbability: 0.8,
-            maxStateTokens: 20_000,
+            maxInputTokens: 20_000,
             onOversize: "escalate",
           }),
           env: { CLOUDFLARE_API_TOKEN: "env-token", CLOUDFLARE_ACCOUNT_ID: accountId },
@@ -315,7 +317,7 @@ describe("parsePluginConfiguration", () => {
         endpoint: `https://api.cloudflare.com/client/v4/accounts/${optionAccount}/ai/run/@cf/cloudflare/clef-flash`,
         model: "clef-flash",
         minAllowProbability: 0.8,
-        maxStateTokens: 20_000,
+        maxInputTokens: 20_000,
         onOversize: "escalate",
       });
     });
@@ -582,7 +584,7 @@ describe("parsePluginConfiguration", () => {
         parsePluginConfiguration(typeSafeOptionsWithEnv({ onOversize: "human" })),
       ).toThrow("reviewer.decision");
       expect(() =>
-        parsePluginConfiguration(typeSafeOptionsWithEnv({ maxStateTokens: 100_000 })),
+        parsePluginConfiguration(typeSafeOptionsWithEnv({ maxInputTokens: 100_000 })),
       ).toThrow("reviewer.decision");
     });
   });
@@ -715,6 +717,7 @@ describe("parsePluginConfiguration", () => {
       ).toEqual({
         backend: "decision",
         agent: { maxInputBytes: 200_000 },
+        maxUserMessages: 5,
         timeoutMs: 30_000,
         recordUsage: true,
         decision: {
@@ -723,7 +726,7 @@ describe("parsePluginConfiguration", () => {
           endpoint: "https://api.typesafe.ai/v1/systemone",
           model: "jev-latest",
           minAllowProbability: 0.6,
-          maxStateTokens: 28_000,
+          maxInputTokens: 28_000,
           onOversize: "escalate",
         },
       });
@@ -754,5 +757,89 @@ describe("parsePluginConfiguration", () => {
         }),
       ).toThrow('the deprecated reviewer.backend "jev" reads reviewer.jev only');
     });
+  });
+});
+
+describe("review context configuration", () => {
+  it("accepts a single-message window or a larger bounded window", () => {
+    for (const maxUserMessages of [1, 10, 50]) {
+      expect(
+        parsePluginConfiguration({
+          options: { reviewer: { maxUserMessages } },
+          env: {},
+        }).reviewer.maxUserMessages,
+      ).toBe(maxUserMessages);
+    }
+  });
+
+  it.each([0, -1, 51, 1.5, "5"])("rejects an invalid message count %s", (maxUserMessages) => {
+    expect(() =>
+      parsePluginConfiguration({
+        options: { reviewer: { maxUserMessages } },
+        env: {},
+      }),
+    ).toThrow("Invalid auto-approval plugin options");
+  });
+
+  it.each(["typesafe", "cloudflare"])(
+    "accepts the deprecated budget for %s and warns",
+    (provider) => {
+      const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+      try {
+        const configuration = parsePluginConfiguration({
+          options: {
+            reviewer: {
+              backend: "decision",
+              decision: {
+                provider,
+                apiKey: "test-key",
+                accountId,
+                maxStateTokens: 12_000,
+              },
+            },
+          },
+          env: {},
+        });
+        expect(configuration.reviewer.decision?.maxInputTokens).toBe(12_000);
+        expect(configuration.reviewer.decision).not.toHaveProperty("maxStateTokens");
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("includes state, questions and custom instructions"),
+          expect.objectContaining({ type: "DeprecationWarning" }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
+
+  it.each(["typesafe", "cloudflare"])(
+    "rejects simultaneous old and new budgets for %s",
+    (provider) => {
+      expect(() =>
+        parsePluginConfiguration({
+          options: {
+            reviewer: {
+              backend: "decision",
+              decision: {
+                provider,
+                apiKey: "test-key",
+                accountId,
+                maxStateTokens: 12_000,
+                maxInputTokens: 12_000,
+              },
+            },
+          },
+          env: {},
+        }),
+      ).toThrow("set only reviewer.decision.maxInputTokens");
+    },
+  );
+
+  it.each(["maxInputTokens", "maxStateTokens"])("validates the range of %s", (name) => {
+    for (const value of [999, 60_001, 1.5]) {
+      expect(() => parsePluginConfiguration(typeSafeOptionsWithEnv({ [name]: value }))).toThrow(
+        "Invalid auto-approval plugin options",
+      );
+    }
   });
 });

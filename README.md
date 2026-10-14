@@ -52,6 +52,37 @@ For local development, build the package and place it under `.opencode/plugins/`
 `.opencode/plugin/` (1.x), or link the package through an npm workspace. OpenCode also loads
 TypeScript files placed directly in those directories.
 
+### Loading this fork locally on OpenCode V2
+
+Build the local checkout with `pnpm install --frozen-lockfile --ignore-scripts` and
+`pnpm build`, then use its directory as the plugin package in your OpenCode V2 configuration:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "file:///D:/code/opencode-auto-approval-plugin",
+      "options": {
+        "mode": "on-ask",
+        "reviewer": {
+          "maxUserMessages": 5,
+          "backend": "decision",
+          "decision": {
+            "provider": "cloudflare",
+            "model": "clef",
+            "maxInputTokens": 20000,
+          },
+        },
+      },
+    },
+  ],
+}
+```
+
+Credentials still come from `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as described
+above. Replace an existing registry-package entry for this plugin rather than loading both.
+After rebuilding the local fork, restart the OpenCode service to reload it.
+
 ## Configuration
 
 The defaults are `mode: "on-ask"`, a 30-second review timeout, the provider/model of the main
@@ -125,7 +156,7 @@ remains entirely in OpenCode.
 
 Set `reviewer.backend` to `"decision"` to have a decision model judge each operation instead of an
 OpenCode session. The plugin sends one request with the operation (`source`, `action`,
-`resource`, and the user's latest prompt) and a single `allow` / `deny` / `escalate` choice. No
+`resource`, and the user's recent prompts) and a single `allow` / `deny` / `escalate` choice. No
 reviewer agent or session is created (unless `onOversize` is `"agent"`) and the workspace is not
 inspected. Two providers speak the
 same System One API:
@@ -157,18 +188,19 @@ same System One API:
 }
 ```
 
-| Option                                  | Default                   | Description                                                                                                        |
-| --------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `reviewer.backend`                      | `"agent"`                 | `"agent"`, `"chat"` or `"decision"`                                                                                |
-| `reviewer.decision.provider`            | — (required)              | `"typesafe"` or `"cloudflare"`                                                                                     |
-| `reviewer.decision.apiKey`              | from the environment      | TypeSafe AI API key, or a Cloudflare API token with Workers AI access                                              |
-| `reviewer.decision.baseURL`             | `https://api.typesafe.ai` | `typesafe` only: API origin; a bare HTTPS origin (HTTP only for loopback)                                          |
-| `reviewer.decision.accountId`           | from the environment      | `cloudflare` only: the 32-character account ID                                                                     |
-| `reviewer.decision.model`               | per provider (above)      | Model or alias; pin a version such as `jev-1.13.0` for stable behavior                                             |
-| `reviewer.decision.minAllowProbability` | `0.6`                     | An `allow` answered with a lower probability becomes `escalate`                                                    |
-| `reviewer.decision.maxStateTokens`      | `28000`                   | Estimated size above which an operation is too large to send (1,000–60,000)                                        |
-| `reviewer.decision.onOversize`          | `"escalate"`              | Too large: `"escalate"` to a human, or hand it to the `"agent"` or `"chat"` reviewer                               |
-| `reviewer.agent.maxInputBytes`          | `200000`                  | The agent reviewer escalates a prompt longer than this (UTF-8 bytes) unsent rather than let the session compact it |
+| Option                                  | Default                               | Description                                                                                                        |
+| --------------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `reviewer.backend`                      | `"agent"`                             | `"agent"`, `"chat"` or `"decision"`                                                                                |
+| `reviewer.decision.provider`            | — (required)                          | `"typesafe"` or `"cloudflare"`                                                                                     |
+| `reviewer.decision.apiKey`              | from the environment                  | TypeSafe AI API key, or a Cloudflare API token with Workers AI access                                              |
+| `reviewer.decision.baseURL`             | `https://api.typesafe.ai`             | `typesafe` only: API origin; a bare HTTPS origin (HTTP only for loopback)                                          |
+| `reviewer.decision.accountId`           | from the environment                  | `cloudflare` only: the 32-character account ID                                                                     |
+| `reviewer.decision.model`               | per provider (above)                  | Model or alias; pin a version such as `jev-1.13.0` for stable behavior                                             |
+| `reviewer.decision.minAllowProbability` | `0.6`                                 | An `allow` answered with a lower probability becomes `escalate`                                                    |
+| `reviewer.maxUserMessages`              | `5`                                   | Maximum user prompts per review, including the latest request (1–50)                                               |
+| `reviewer.decision.maxInputTokens`      | `28000` TypeSafe / `20000` Cloudflare | Estimated whole decision-input budget, including state, questions and custom instructions (1,000–60,000)           |
+| `reviewer.decision.onOversize`          | `"escalate"`                          | Too large: `"escalate"` to a human, or hand it to the `"agent"` or `"chat"` reviewer                               |
+| `reviewer.agent.maxInputBytes`          | `200000`                              | The agent reviewer escalates a prompt longer than this (UTF-8 bytes) unsent rather than let the session compact it |
 
 - Prefer the environment variables: `opencode.json` is often committed, and a key written there is
   shared with it. Surrounding whitespace in keys is trimmed. The plugin fails at startup when the
@@ -195,10 +227,11 @@ same System One API:
   rose to allow 0.53, under the default threshold, where `clef` reached 0.80), which is why `clef`
   is the default.
 - The operation leaves your machine: the resource holds the full command, file content of a
-  write or edit, and permission metadata such as diffs, and the user intent is your latest prompt.
+  write or edit, and permission metadata such as diffs. User context includes your latest prompt
+  and any earlier prompts selected within the configured limits.
   All of it is sent to the provider, so an edit of a secrets file sends those secrets.
 - An operation is never sent in part, since a partial view cannot justify an approval. One whose
-  estimated size exceeds `maxStateTokens`, or that the API refuses as too long, is
+  estimated required-input size exceeds `maxInputTokens`, or that the API refuses as too long, is
   [too large](#operations-too-large-for-the-decision-model): by default it escalates to a human with
   the reason.
 - `baseURL` must use HTTPS unless it points at a loopback host (`localhost`, `127.0.0.1`,
@@ -212,15 +245,49 @@ same System One API:
   `reviewer.decision` none with the `agent` backend. Aliases such as `jev-latest` follow new model releases, which may shift
   verdicts; pin a version for stable behavior.
 
+### Recent user-message context
+
+`reviewer.maxUserMessages` defaults to `5` and counts the latest user prompt toward its limit.
+Set it to `1` to provide only the latest prompt. Each OpenCode session has its own bounded,
+in-memory window; reviewer prompts are excluded. Only prompts observed while this plugin is
+running are available: restarting the service resets the window, and existing session history
+is not loaded from disk or fetched through the API.
+
+The latest prompt is `state.userIntent`; older prompts are `state.previousUserMessages`, in
+chronological order, without duplicating the latest. Older messages are background evidence,
+not a replacement for missing latest intent. The review policy tells the model to prefer the
+latest request when it conflicts with earlier permissions, instructions or corrections.
+An empty or attachment-only latest prompt remains unknown intent. All messages stay inside
+untrusted operation data, outside the configured trusted review policy.
+
+The complete operation, review policy and latest user message are required. Starting with
+that input, the plugin adds earlier messages newest first until the first complete message
+that will not fit. It never skips that message to include even older permissions, and never
+cuts a message or operation in half. The decision backend uses its whole-input token estimate;
+agent and chat reviewers use their existing UTF-8 prompt-byte budgets. An oversized required
+input follows the existing escalation or fallback behavior; fallback receives the original
+request and selects history according to its own budget.
+
+`reviewer.decision.maxStateTokens` is deprecated. It is still accepted as an alias for
+`maxInputTokens`, with a warning, but its value now limits the whole input instead of state
+alone. Supplying both names is an error, even if their values match. This also applies to the
+legacy `decisionModel` and `jev` configuration forms.
+
 ### Operations too large for the decision model
 
-Jev refuses a `state` over 32Ki tokens, and Clef, which accepts 64Ki, slows to tens of seconds
-past 20,000. Before sending, the plugin estimates the size conservatively (ASCII at 2.5 characters
-a token, any other character at 1.1 tokens: Japanese measured about one token per character on
-both models, so a Japanese file reaches Jev's default 28,000-token budget at about 25,000
-characters; Clef's default is 20,000 to stay within the default timeout)
-and treats Jev's `max_tokens_exceeded` the same way. What happens next is
-`reviewer.decision.onOversize`:
+The decision backend applies `maxInputTokens` to the serialized request body: the full
+operation state, selected user messages, built-in question instructions and options, custom
+`reviewer.instructions`, and JSON wrapping. The author's estimate is unchanged: ASCII at 2.5
+characters a token and any other Unicode code point at 1.1 tokens. This is a local estimate,
+not a tokenizer count or an API parameter; leave room for estimation error and the provider's
+model template. Clef's API can truncate long state, so a successful answer does not prove the
+provider read everything.
+
+The defaults remain 28,000 for TypeSafe and 20,000 for Cloudflare. The original measurements
+reported Clef taking 46 seconds on a 38k-token input, so 20,000 is a latency budget rather than
+a provider limit or a guaranteed performance threshold. Jev's `max_tokens_exceeded` refusal
+also counts as oversized. If the full operation, policy and latest user prompt do not fit,
+nothing is sent; `reviewer.decision.onOversize`:
 
 | `onOversize`         | Too-large operation                                                                                      |
 | -------------------- | -------------------------------------------------------------------------------------------------------- |

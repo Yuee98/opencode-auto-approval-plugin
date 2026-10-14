@@ -233,3 +233,27 @@ describe("ChatReviewer", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+describe("ChatReviewer bounded user history", () => {
+  it("retains the operation and latest messages whole under the byte budget", async () => {
+    const { reviewer, fetch } = chatReviewer({
+      maxInputBytes: 4096,
+      response: async () => completion({ content: '{"verdict":"escalate","reason":"wait"}' }),
+    });
+    await reviewer.review({
+      ...request,
+      userIntent: "Do not push yet",
+      previousUserMessages: ["旧".repeat(2000), "Wait for review"],
+    });
+    const prompt: string = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).messages[1].content;
+    const operation = JSON.parse(
+      prompt.split("\n").find((line) => line.startsWith('{"source"')) ?? "{}",
+    );
+    expect(operation).toMatchObject({
+      resource: request.resource,
+      userIntent: "Do not push yet",
+      previousUserMessages: ["Wait for review"],
+    });
+    expect(Buffer.byteLength(prompt, "utf8")).toBeLessThanOrEqual(4096);
+  });
+});

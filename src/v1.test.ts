@@ -309,3 +309,37 @@ describe("V1 session client", () => {
     });
   });
 });
+
+describe("V1 user-message windows", () => {
+  it("passes recent user prompts in order and excludes reviewer chatter", async () => {
+    const { context } = createContext();
+    const { plugin, review, isReviewerSession } = createPlugin({ verdict: "allow" });
+    isReviewerSession.mockImplementation(
+      (input: { sessionID: string }) => input.sessionID === "review-session",
+    );
+    const hooks = await plugin(context as never, {
+      mode: "all-tools",
+      reviewer: { maxUserMessages: 2 },
+    });
+    for (const text of ["discarded", "Push now", "Do not push yet"]) {
+      await hooks["chat.message"]?.({ sessionID: "session-1" } as never, {
+        message: {} as never,
+        parts: [{ type: "text", text }] as never,
+      });
+    }
+    await hooks["chat.message"]?.({ sessionID: "review-session" } as never, {
+      message: {} as never,
+      parts: [{ type: "text", text: "Reviewer prompt" }] as never,
+    });
+    await hooks["tool.execute.before"]?.(
+      { sessionID: "session-1", tool: "bash" } as never,
+      { args: { command: "git push" } } as never,
+    );
+    expect(review).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userIntent: "Do not push yet",
+        previousUserMessages: ["Push now"],
+      }),
+    );
+  });
+});

@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 
 import { parsePluginConfiguration } from "./config.js";
 import { DecisionReviewer } from "./decision-reviewer.js";
-import { OversizeError, type ReviewRequest, userInstructionsPreamble } from "./reviewer.js";
+import {
+  estimateTokens,
+  OversizeError,
+  type ReviewRequest,
+  reviewState,
+  userInstructionsPreamble,
+} from "./reviewer.js";
 import type { UsageRecord } from "./usage.js";
 
 const request: ReviewRequest = {
@@ -441,7 +447,7 @@ describe("DecisionReviewer usage records", () => {
   });
 });
 
-function oversizeReviewer(input: { response: () => Promise<Response>; maxStateTokens?: number }) {
+function oversizeReviewer(input: { response: () => Promise<Response>; maxInputTokens?: number }) {
   const records: UsageRecord[] = [];
   const fetch = vi.fn<typeof globalThis.fetch>(input.response);
   const reviewer = new DecisionReviewer({
@@ -449,7 +455,7 @@ function oversizeReviewer(input: { response: () => Promise<Response>; maxStateTo
       options: {
         reviewer: {
           backend: "decision",
-          decision: { provider: "typesafe", maxStateTokens: input.maxStateTokens },
+          decision: { provider: "typesafe", maxInputTokens: input.maxInputTokens },
         },
       },
       env: { TYPESAFE_API_KEY: "test-key" },
@@ -475,7 +481,7 @@ describe("DecisionReviewer with an operation too large for the model", () => {
 
     await expect(review).rejects.toBeInstanceOf(OversizeError);
     await expect(review).rejects.toThrow(
-      /too large for jev-latest \(about 33,0\d\d tokens, budget 28,000\)/,
+      /too large for jev-latest \(about [\d,]+ tokens, budget 28,000\)/,
     );
     expect(fetch).not.toHaveBeenCalled();
     expect(records).toMatchObject([{ verdict: "oversize", inputTokens: 0, costUSD: 0 }]);
@@ -500,7 +506,7 @@ describe("DecisionReviewer with an operation too large for the model", () => {
 
   it("follows a configured budget", async () => {
     const { reviewer, fetch } = oversizeReviewer({
-      maxStateTokens: 1_000,
+      maxInputTokens: 1_000,
       response: async () => answer({ choice: "allow" }),
     });
 
@@ -547,5 +553,87 @@ describe("DecisionReviewer with an operation too large for the model", () => {
       /counted 1,000 tokens for a prompt of at least [\d,]+, so it likely cut the input/,
     );
     expect(records).toMatchObject([{ verdict: "oversize", inputTokens: 1_000 }]);
+  });
+});
+
+function bounded(
+  input: { maxInputTokens?: number; instructions?: string; maxUserMessages?: number } = {},
+) {
+  const fetch = vi.fn<typeof globalThis.fetch>(async () =>
+    Response.json({
+      answers: { verdict: { choice: "allow", probabilities: { allow: 0.95 } } },
+      usage: { input_tokens: 10_000, output_tokens: 0 },
+    }),
+  );
+  const reviewer = new DecisionReviewer({
+    fetch,
+    configuration: parsePluginConfiguration({
+      options: {
+        reviewer: {
+          backend: "decision",
+          instructions: input.instructions,
+          maxUserMessages: input.maxUserMessages,
+          decision: {
+            provider: "typesafe",
+            apiKey: "test-key",
+            maxInputTokens: input.maxInputTokens,
+          },
+        },
+      },
+      env: {},
+    }),
+  });
+  return { reviewer, fetch };
+}
+
+describe("DecisionReviewer whole-input budget and user history", () => {
+  it("counts custom instructions and built-in questions even when state alone fits", async () => {
+    const { reviewer, fetch } = bounded({ maxInputTokens: 1000, instructions: "界".repeat(800) });
+    expect(estimateTokens(JSON.stringify(reviewState(request)))).toBeLessThan(1000);
+    await expect(reviewer.review(request)).rejects.toBeInstanceOf(OversizeError);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("selects whole recent messages using the final request body and honors an exact boundary", async () => {
+    const latest = { ...request, userIntent: "请".repeat(800) };
+    const previousUserMessages = ["very old ".repeat(1000), "middle", 'newest 中文😀 "quote"\n'];
+    const probe = bounded();
+    await probe.reviewer.review({ ...latest, previousUserMessages: previousUserMessages.slice(1) });
+    const expected = JSON.parse(String(probe.fetch.mock.calls[0]?.[1]?.body));
+    const budget = estimateTokens(JSON.stringify(expected));
+    const limited = bounded({ maxInputTokens: budget });
+    await limited.reviewer.review({ ...latest, previousUserMessages });
+    const body = JSON.parse(String(limited.fetch.mock.calls[0]?.[1]?.body));
+    expect(body).toEqual(expected);
+    expect(estimateTokens(JSON.stringify(body))).toBe(budget);
+    expect(body.state.resource).toEqual(latest.resource);
+    expect(body.state.userIntent).toBe(latest.userIntent);
+    expect(body.questions.verdict.instructions).toContain("latest request overrides");
+  });
+
+  it("counts the latest request in the configured window and does not duplicate it", async () => {
+    const { reviewer, fetch } = bounded({ maxUserMessages: 2 });
+    await reviewer.review({ ...request, previousUserMessages: ["oldest", "recent"] });
+    const state = JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).state;
+    expect(state.previousUserMessages).toEqual(["recent"]);
+    expect(state.userIntent).toBe(request.userIntent);
+  });
+
+  it("keeps absent latest intent null even when older messages grant permission", async () => {
+    const { reviewer, fetch } = bounded();
+    await reviewer.review({
+      ...request,
+      userIntent: " ",
+      previousUserMessages: ["Push the branch."],
+    });
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body)).state.userIntent).toBeNull();
+  });
+
+  it("does not trim an oversized latest request to obtain an approval", async () => {
+    const { reviewer, fetch } = bounded({ maxInputTokens: 1000 });
+    await expect(
+      reviewer.review({ ...request, userIntent: "新".repeat(2000), previousUserMessages: ["old"] }),
+    ).rejects.toBeInstanceOf(OversizeError);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

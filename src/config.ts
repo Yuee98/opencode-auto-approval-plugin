@@ -43,8 +43,8 @@ export type DecisionConfiguration = {
   model: string;
   /** An `allow` below this probability is downgraded to `escalate`. */
   minAllowProbability: number;
-  /** The estimated `state` size above which an operation is not sent. */
-  maxStateTokens: number;
+  /** The estimated whole decision input size, including questions and policy. */
+  maxInputTokens: number;
   onOversize: OversizeAction;
 };
 
@@ -67,6 +67,8 @@ export type PluginConfiguration = {
       /** Prompts longer than this, in UTF-8 bytes, escalate unsent. */
       maxInputBytes: number;
     };
+    /** Maximum user messages per review, including the latest request. */
+    maxUserMessages: number;
     timeoutMs: number;
     /** The user's own review policy, added to every review as trusted guidance. */
     instructions?: string;
@@ -95,11 +97,11 @@ const cloudflareModelPattern = /^[a-z\d][a-z\d.-]*$/;
 const defaultMinAllowProbability = 0.6;
 
 /**
- * Jev refuses a `state` above 32Ki tokens, so 28,000 leaves room for the
- * questions and the estimate. Clef accepts 64Ki but took 46 s for 38k tokens,
+ * Jev refuses a `state` above 32Ki tokens, so a 28,000 whole-input budget
+ * leaves room for estimation error and the model template. Clef accepts 64Ki but took 46 s for 38k tokens,
  * past the default timeout, so its budget stays where it answered in seconds.
  */
-const defaultMaxStateTokens: Record<DecisionProvider, number> = {
+const defaultMaxInputTokens: Record<DecisionProvider, number> = {
   typesafe: 28_000,
   cloudflare: 20_000,
 };
@@ -135,6 +137,8 @@ const decisionOptionsShape = {
   apiKey: z.optional(z.string()),
   model: z.optional(z.string().check(z.minLength(1))),
   minAllowProbability: z.optional(z.number().check(z.gte(0), z.lte(1))),
+  maxInputTokens: z.optional(z.int().check(z.gte(1_000), z.lte(60_000))),
+  /** Deprecated input name; now also limits the whole decision input. */
   maxStateTokens: z.optional(z.int().check(z.gte(1_000), z.lte(60_000))),
   onOversize: z.optional(z.enum(oversizeActions)),
 };
@@ -168,6 +172,7 @@ const pluginConfigurationSchema = z.object({
       agent: z.optional(agentOptionsSchema),
       /** Deprecated: `agent.model`. */
       model: z.optional(modelReferenceSchema),
+      maxUserMessages: z.optional(z.int().check(z.gte(1), z.lte(50))),
       timeoutMs: z.optional(z.number().check(z.gte(1), z.lte(120_000))),
       instructions: z.optional(z.union([z.string(), z.array(z.string())])),
       recordUsage: z.optional(z.boolean()),
@@ -206,6 +211,7 @@ export function parsePluginConfiguration(input: {
     reviewer: {
       backend,
       agent: agentConfiguration(reviewer),
+      maxUserMessages: reviewer?.maxUserMessages ?? 5,
       timeoutMs: reviewer?.timeoutMs ?? 30_000,
       ...(instructions === undefined ? {} : { instructions }),
       recordUsage: reviewer?.recordUsage ?? true,
@@ -268,6 +274,23 @@ function reviewerInstructions(input: string | string[] | undefined): string | un
 type ReviewerOptions = NonNullable<z.infer<typeof pluginConfigurationSchema>["reviewer"]>;
 
 type DecisionOptions = z.infer<typeof decisionOptionsSchema>;
+
+/** Normalize the deprecated state-only setting into the whole-input budget. */
+function decisionInputBudget(input: { options: DecisionOptions; prefix: string }): number {
+  const { maxInputTokens, maxStateTokens } = input.options;
+  if (maxInputTokens !== undefined && maxStateTokens !== undefined) {
+    throw new Error(
+      `Invalid auto-approval plugin options: ${input.prefix}.maxStateTokens is deprecated; set only ${input.prefix}.maxInputTokens.`,
+    );
+  }
+  if (maxStateTokens !== undefined) {
+    process.emitWarning(
+      `${input.prefix}.maxStateTokens is deprecated; use maxInputTokens. The budget now includes state, questions and custom instructions.`,
+      { type: "DeprecationWarning", code: "AUTO_APPROVAL_MAX_STATE_TOKENS" },
+    );
+  }
+  return maxInputTokens ?? maxStateTokens ?? defaultMaxInputTokens[input.options.provider];
+}
 
 /**
  * A key next to its deprecated name fails for every backend, so neither is
@@ -376,7 +399,7 @@ function typeSafeConfiguration(input: {
     endpoint: typeSafeEndpoint(source.baseURL ?? defaultTypeSafeBaseURL),
     model: input.options.model ?? defaultModels.typesafe,
     minAllowProbability: input.options.minAllowProbability ?? defaultMinAllowProbability,
-    maxStateTokens: input.options.maxStateTokens ?? defaultMaxStateTokens.typesafe,
+    maxInputTokens: decisionInputBudget({ options: input.options, prefix: input.prefix }),
     onOversize: input.options.onOversize ?? "escalate",
   };
 }
@@ -425,7 +448,7 @@ function cloudflareConfiguration(input: {
     endpoint: `https://api.cloudflare.com/client/v4/accounts/${accountID}/ai/run/@cf/cloudflare/${model}`,
     model,
     minAllowProbability: input.options.minAllowProbability ?? defaultMinAllowProbability,
-    maxStateTokens: input.options.maxStateTokens ?? defaultMaxStateTokens.cloudflare,
+    maxInputTokens: decisionInputBudget({ options: input.options, prefix: input.prefix }),
     onOversize: input.options.onOversize ?? "escalate",
   };
 }

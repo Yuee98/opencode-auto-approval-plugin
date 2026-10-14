@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -87,13 +88,13 @@ describe("costUSD", () => {
 describe("usageLogPath", () => {
   it("lives under XDG_DATA_HOME", () => {
     expect(usageLogPath({ env: { XDG_DATA_HOME: "/data" } })).toBe(
-      "/data/opencode-auto-approval-plugin/usage.jsonl",
+      join("/data", "opencode-auto-approval-plugin", "usage.jsonl"),
     );
   });
 
   it("falls back to ~/.local/share", () => {
-    expect(usageLogPath({ env: {} })).toMatch(
-      /\/\.local\/share\/opencode-auto-approval-plugin\/usage\.jsonl$/,
+    expect(usageLogPath({ env: {} })).toBe(
+      join(homedir(), ".local", "share", "opencode-auto-approval-plugin", "usage.jsonl"),
     );
   });
 });
@@ -130,7 +131,8 @@ describe("fileUsageRecorder", () => {
       const lines = (await readFile(path, "utf8")).trim().split("\n");
       expect(lines.map((line) => JSON.parse(line).verdict)).toEqual(["deny", "allow"]);
     });
-    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    // Windows uses ACLs; POSIX permission bits are only meaningful on other platforms.
+    if (process.platform !== "win32") expect((await stat(path)).mode & 0o777).toBe(0o600);
   });
 
   it("drops a record it cannot write, then recovers once the directory can be made", async () => {
